@@ -1,155 +1,128 @@
-# Idempotency-Gateway (The "Pay-Once" Protocol)
+# Idempotency Gateway
 
-This challenge is designed to test your ability to bridge Computer Science fundamentals with Modern Backend Engineering.
+NestJS service that processes `POST /process-payment` **at most once** per `Idempotency-Key` + body pair, with safe retries and concurrent-request handling.
 
-## 1. Business Context
+## Architecture
 
-> **Client:** _FinSafe Transactions Ltd._ (A fast-growing Payment Processor).
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant API as Nest API
+  participant M as Per-Key Mutex
+  participant S as In-Memory Store
 
-### The Problem
+  C->>API: POST /process-payment (Idempotency-Key, body)
+  API->>M: acquire(key)
+  M-->>API: held (serializes same key)
 
-FinSafe's clients (e-commerce shops) occasionally experience network timeouts. When this happens, their servers automatically retry sending payment requests. Recently, this has led to a critical issue: **Double Charging**.
+  alt New key or TTL expired
+    API->>S: lookup(key) miss
+    API->>API: delay 2s (simulate charge)
+    API->>S: save status + body + expiry
+    API-->>C: 201 + JSON (no X-Cache-Hit)
+  else Same key + same body (cached)
+    API->>S: lookup hit
+    API-->>C: same status + body + X-Cache-Hit: true
+  else Same key + different body
+    API-->>C: 409 Conflict + message
+  end
 
-If a customer clicks "Pay," the request is sent, but the network lags. The client retries the request. FinSafe processes _both_ requests, charging the customer twice. This is causing customer churn and regulatory headaches.
+  Note over M: Request B waits on mutex while A processes; then reads same stored result.
+```
 
-### The Solution
+## Setup
 
-FinSafe needs you to build an **Idempotency Layer**. This is a middleware service (or API) that ensures no matter how many times a client sends the same request, the payment is processed **exactly once**.
+```bash
+cd backend/Idempotency-gateway
+npm ci
+npm start
+```
 
----
+- **API:** `http://localhost:3000` (override with `PORT`)
+- **Swagger:** `http://localhost:3000/docs`
 
-## 2. Technical Objective
+## API
 
-Build a RESTful API that mimics a payment processing backend. It must check for a unique `Idempotency-Key` in the HTTP headers.
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/process-payment` | Idempotent payment simulation |
 
-- **First Request:** Process the payment and save the response.
-- **Duplicate Request:** Detect the existing key and return the _saved_ response immediately, without processing the payment again.
+### Headers
 
----
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Idempotency-Key` | Yes | Client-supplied unique key for this logical operation |
+| `Content-Type` | Yes (for JSON) | `application/json` |
 
-## 3. Getting Started
+### Request body
 
-1.  **Fork this Repository:** Do not clone it directly. Create a fork to your own GitHub account.
-2.  **Environment:** You may use **Node.js, Python, Java or Go, etc.**. You may use any database or in-memory store (Redis, SQLite, or a simple native Map/Dictionary variable).
-3.  **Submission:** Your final submission will be a link to your forked repository containing the source code and documentation.
+| Field | Type | Rules |
+|-------|------|--------|
+| `amount` | integer | ≥ 1 |
+| `currency` | string | Exactly 3 letters (stored uppercased, e.g. `GHS`) |
 
----
+### Success (first process)
 
-## 4. The Architecture Diagram
+- **Status:** `201 Created`
+- **Body:** `{ "message": "Charged <amount> <currency>", "amount", "currency" }`
+- **Processing:** server waits **2 seconds** once per key+body (until TTL expires).
 
-**Task:** Before you write any code, you must design the logic flow.
-**Deliverable:** A **Sequence Diagram** or **Flowchart** included in your README.
+### Retry / duplicate (same key + same body)
 
----
+- **Status & body:** identical to the first successful response
+- **Header:** `X-Cache-Hit: true`
+- **No** extra 2s processing delay
 
-## 5. User Stories & Acceptance Criteria
+### Same key, different body
 
-### User Story 1: The First Transaction (Happy Path)
+- **Status:** `409 Conflict`
+- **Message:** `Idempotency key already used for a different request body.`
 
-**As a** client system (e.g., an online store),
-**I want to** send a payment request with a unique ID,
-**So that** my transaction is processed successfully.
+### Examples (curl)
 
-**Acceptance Criteria:**
+First charge:
 
-- [ ] The API accepts a `POST` request to endpoint `/process-payment`.
-- [ ] The request header must contain `Idempotency-Key: <some-unique-string>`.
-- [ ] The request body accepts a JSON object (e.g., `{"amount": 100, "currency": "GHS"}`).
-- [ ] The server simulates processing (e.g., a 2-second delay) and returns a `200 OK` or `201 Created` response.
-- [ ] The response body should include a status message: `"Charged 100 GHS"`.
+```bash
+curl -sS -D - -X POST http://localhost:3000/process-payment \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-key-1' \
+  --data '{"amount":100,"currency":"GHS"}'
+```
 
-### User Story 2: The Duplicate Attempt (Idempotency Logic)
+Duplicate (instant replay, note header):
 
-**As a** client system,
-**I want to** safely retry a request if I don't hear back,
-**So that** I don't accidentally double-charge the user.
+```bash
+curl -sS -D - -X POST http://localhost:3000/process-payment \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-key-1' \
+  --data '{"amount":100,"currency":"GHS"}'
+```
 
-**Acceptance Criteria:**
+Conflict:
 
-- [ ] If the client sends a second `POST` request with the **same** `Idempotency-Key` and payload:
-  - [ ] The server must **NOT** run the processing logic again (no 2-second delay).
-  - [ ] The server must return the **exact same** response body and status code as the first successful request.
-  - [ ] The server returns a header `X-Cache-Hit: true` to indicate this was a replayed response.
+```bash
+curl -sS -D - -X POST http://localhost:3000/process-payment \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-key-1' \
+  --data '{"amount":500,"currency":"GHS"}'
+```
 
-### User Story 3: Different Request, Same Key (Fraud/Error Check)
+Missing key:
 
-**As a** security officer,
-**I want to** reject requests that reuse keys for different payments,
-**So that** we maintain data integrity.
+```bash
+curl -sS -D - -X POST http://localhost:3000/process-payment \
+  -H 'Content-Type: application/json' \
+  --data '{"amount":100,"currency":"GHS"}'
+```
 
-**Acceptance Criteria:**
+## Design decisions
 
-- [ ] If a request arrives with an existing `Idempotency-Key` but a **different** request body (e.g., changing amount from 100 to 500):
-  - [ ] The server must return a `422 Unprocessable Entity` or `409 Conflict` error.
-  - [ ] The error message should state: `"Idempotency key already used for a different request body."`
+- **Per-key `async-mutex`:** All requests for the same idempotency key run exclusively. That implements the **in-flight** rule: a second identical request waits for the first, then reads the stored outcome—no double delay, no spurious 409.
+- **Fingerprint:** Canonical JSON of `{ amount, currency }` so “same payment” is deterministic.
+- **In-memory `Map`:** Enough for the exercise; swap for Redis/Postgres in production.
+- **`201 Created`:** Single chosen success code so retries replay the exact status.
+- **Validation:** Rejects bad input early (`400`) before idempotency logic.
 
----
+## Developer’s choice: TTL on idempotency records
 
-## 6. Bonus User Story (The "In-Flight" Check)
-
-**As a** system architect,
-**I want to** handle cases where two identical requests arrive at the exact same time,
-**So that** we don't succumb to race conditions.
-
-**Scenario:** Request A arrives. While Request A is still "processing" (during the 2-second delay), Request B (same key) arrives.
-
-**Acceptance Criteria:**
-
-- [ ] Request B should not start a new process.
-- [ ] Request B should not return `409 Conflict`.
-- [ ] Request B should wait (block) until Request A finishes, and then return the result of Request A.
-
----
-
-## 7. The "Developer's Choice" Challenge
-
-We believe great engineers are also product thinkers.
-
-**Task:** Identify **one** additional feature or safety mechanism that would make this system better for a real-world Fintech company.
-
-1.  **Implement it.**
-2.  **Document it:** Explain _why_ you added it in your README.
-
----
-
-## 8. Documentation Requirements
-
-Your final `README.md` must replace these instructions. It must cover:
-
-1.  **Architecture Diagram**
-2.  **Setup Instructions**
-3.  **API Documentation**
-4.  **Design Decisions**
-5.  **The Developer's Choice:** Description of the extra feature you added.
-
----
-
-Submit your repo link via the [online](https://forms.cloud.microsoft/e/bLyGT3byxx) form.
-
----
-
-## 🛑 Pre-Submission Checklist
-
-**WARNING:** Before you submit your solution, you **MUST** pass every item on this list.
-If you miss any of these critical steps, your submission will be **automatically rejected** and you will **NOT** be invited to an interview.
-
-### 1. 📂 Repository & Code
-
-- [ ] **Public Access:** Is your GitHub repository set to **Public**? (We cannot review private repos).
-- [ ] **Clean Code:** Did you remove unnecessary files (like `node_modules`, `.env` with real keys, or `.DS_Store`)?
-- [ ] **Run Check:** if we clone your repo and run `npm start` (or equivalent), does the server start immediately without crashing?
-
-### 2. 📄 Documentation (Crucial)
-
-- [ ] **Architecture Diagram:** Did you include a visual Diagram (Flowchart or Sequence Diagram) in the README?
-- [ ] **README Swap:** Did you **DELETE** the original instructions (the problem brief) from this file and replace it with your own documentation?
-- [ ] **API Docs:** Is there a clear list of Endpoints and Example Requests in the README?
-
-### 3. 🧹 Git Hygiene
-
-- [ ] **Commit History:** Does your repo have multiple commits with meaningful messages? (A single "Initial Commit" is a red flag).
-
----
-
-**Ready?**
-If you checked all the boxes above, submit your repository link in the application form. Good luck! 🚀
+Each stored outcome gets an **expiry** (default **24 hours**). After expiry, the key slot is removed (lazy eviction on access + periodic sweep). **Why:** real processors cannot keep unbounded in-memory keys; regulators and risk teams also expect **bounded retention** so keys can eventually be reused safely after a defined window. Tune `IDEMPOTENCY_TTL_MS` in `src/payment/payment.constants.ts`.
