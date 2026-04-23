@@ -11,23 +11,23 @@ sequenceDiagram
   participant M as Per-Key Mutex
   participant S as In-Memory Store
 
-  C->>API: POST /process-payment (Idempotency-Key, body)
-  API->>M: acquire(key)
-  M-->>API: held (serializes same key)
+  C->>API: POST process-payment with Idempotency-Key and body
+  API->>M: acquire key
+  M-->>API: held, serializes same key
 
   alt New key or TTL expired
-    API->>S: lookup(key) miss
-    API->>API: delay 2s (simulate charge)
-    API->>S: save status + body + expiry
-    API-->>C: 201 + JSON (no X-Cache-Hit)
-  else Same key + same body (cached)
+    API->>S: lookup miss
+    API->>API: delay 2s simulate charge
+    API->>S: save status body expiry
+    API-->>C: 201 JSON without X-Cache-Hit header
+  else Same key same body cached
     API->>S: lookup hit
-    API-->>C: same status + body + X-Cache-Hit: true
-  else Same key + different body
-    API-->>C: 409 Conflict + message
+    API-->>C: 201 same body, X-Cache-Hit true
+  else Same key different body
+    API-->>C: 409 Conflict and message
   end
 
-  Note over M: Request B waits on mutex while A processes; then reads same stored result.
+  Note over M,API: B waits until A finishes, then returns same stored result
 ```
 
 ## Setup
