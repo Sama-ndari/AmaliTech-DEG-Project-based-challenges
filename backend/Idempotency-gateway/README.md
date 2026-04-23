@@ -43,44 +43,47 @@ npm start
 
 ## API
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/process-payment` | Idempotent payment simulation |
+**Base URL (local):** `http://localhost:3000`  
+**Interactive docs:** `GET /docs` (Swagger UI)
 
-### Headers
+### Endpoints
+
+| # | Method | Path | Purpose |
+|---|--------|------|---------|
+| 1 | `POST` | `/process-payment` | Simulate a charge; idempotent per `Idempotency-Key` + body |
+| 2 | `GET` | `/docs` | Swagger (optional, for manual testing) |
+
+### Headers (`POST /process-payment`)
 
 | Header | Required | Description |
 |--------|----------|-------------|
-| `Idempotency-Key` | Yes | Client-supplied unique key for this logical operation |
-| `Content-Type` | Yes (for JSON) | `application/json` |
+| `Idempotency-Key` | Yes | Unique string for this logical operation (retries must reuse it) |
+| `Content-Type` | Yes | `application/json` |
 
-### Request body
+### Request body (`POST /process-payment`)
 
 | Field | Type | Rules |
 |-------|------|--------|
 | `amount` | integer | ≥ 1 |
-| `currency` | string | Exactly 3 letters (stored uppercased, e.g. `GHS`) |
+| `currency` | string | Exactly 3 letters (normalized to uppercase, e.g. `ghs` → `GHS`) |
 
-### Success (first process)
+### Responses (what to expect)
 
-- **Status:** `201 Created`
-- **Body:** `{ "message": "Charged <amount> <currency>", "amount", "currency" }`
-- **Processing:** server waits **2 seconds** once per key+body (until TTL expires).
+| Case | HTTP | Response body (shape) | Response headers |
+|------|------|------------------------|-------------------|
+| First charge for key + body | `201` | `{"message":"Charged 100 GHS","amount":100,"currency":"GHS"}` | no `X-Cache-Hit` |
+| Same key + same JSON again | `201` | **Identical** JSON to first success | `X-Cache-Hit: true` |
+| Same key + different JSON | `409` | Nest error JSON; `message` = `Idempotency key already used for a different request body.` | — |
+| Missing `Idempotency-Key` | `400` | `message` explains missing header | — |
+| Invalid body (e.g. amount 0) | `400` | class-validator error payload | — |
 
-### Retry / duplicate (same key + same body)
+**Timing:** first charge waits **~2 seconds** (simulated processing). Cached replay returns immediately (no second delay).
 
-- **Status & body:** identical to the first successful response
-- **Header:** `X-Cache-Hit: true`
-- **No** extra 2s processing delay
+### Example requests (`curl`)
 
-### Same key, different body
+Replace `demo-key-1` with your own key per test run.
 
-- **Status:** `409 Conflict`
-- **Message:** `Idempotency key already used for a different request body.`
-
-### Examples (curl)
-
-First charge:
+**1  First charge (happy path, ~2s)**
 
 ```bash
 curl -sS -D - -X POST http://localhost:3000/process-payment \
@@ -89,7 +92,7 @@ curl -sS -D - -X POST http://localhost:3000/process-payment \
   --data '{"amount":100,"currency":"GHS"}'
 ```
 
-Duplicate (instant replay, note header):
+**2  Safe retry (same key + same body, fast; check `X-Cache-Hit: true`)**
 
 ```bash
 curl -sS -D - -X POST http://localhost:3000/process-payment \
@@ -98,7 +101,7 @@ curl -sS -D - -X POST http://localhost:3000/process-payment \
   --data '{"amount":100,"currency":"GHS"}'
 ```
 
-Conflict:
+**3  Fraud / mismatch (same key, different amount)**
 
 ```bash
 curl -sS -D - -X POST http://localhost:3000/process-payment \
@@ -107,12 +110,25 @@ curl -sS -D - -X POST http://localhost:3000/process-payment \
   --data '{"amount":500,"currency":"GHS"}'
 ```
 
-Missing key:
+**4  Missing idempotency key**
 
 ```bash
 curl -sS -D - -X POST http://localhost:3000/process-payment \
   -H 'Content-Type: application/json' \
   --data '{"amount":100,"currency":"GHS"}'
+```
+
+**5  In-flight / parallel (two identical requests; wall time ~2s, not ~4s)**
+
+```bash
+KEY="parallel-$(date +%s)"
+curl -sS -X POST http://localhost:3000/process-payment \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $KEY" \
+  --data '{"amount":1,"currency":"USD"}' &
+curl -sS -X POST http://localhost:3000/process-payment \
+  -H 'Content-Type: application/json' -H "Idempotency-Key: $KEY" \
+  --data '{"amount":1,"currency":"USD"}' &
+wait
 ```
 
 ## Design decisions
